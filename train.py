@@ -299,7 +299,7 @@ def main(args):
                 loss.backward()
                 opt.step()
             else:
-                scal_er.scale(loss).backward()
+                scaler.scale(loss).backward()
                 if config.get('grad_clip_val', 0) > 0:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val'])
