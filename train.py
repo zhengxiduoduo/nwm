@@ -196,6 +196,7 @@ def main(args):
                     goals_per_obs = int(data_config["goals_per_obs"])
                     if data_split_type == 'test':
                         goals_per_obs = 4 # standardize testing
+                        # 其实不是很理解这个goals per observation是啥，看论文时注意
                     
                     if "distance" in data_config:
                         min_dist_cat=data_config["distance"]["min_dist_cat"]
@@ -283,6 +284,7 @@ def main(args):
                 
                 num_goals = T - num_cond
                 x_start = x[:, num_cond:].flatten(0, 1)
+                # 所以这一大段都不是很懂，就是跟x相关的，再着重看一下
                 x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
                 y = y.flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
@@ -297,7 +299,7 @@ def main(args):
                 loss.backward()
                 opt.step()
             else:
-                scaler.scale(loss).backward()
+                scal_er.scale(loss).backward()
                 if config.get('grad_clip_val', 0) > 0:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val'])

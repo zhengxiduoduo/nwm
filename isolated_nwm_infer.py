@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-#from distributed import init_distributed
+from distributed import init_distributed
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -123,7 +123,7 @@ def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
         image_file = os.path.join(sample_folder, f'{sec}.png')
         save_image(image_file, x_pred_pixels[batch_idx], True)
 
-@torch.no_grad
+@torch.no_grad()
 def main(args):
     _, _, device, _ = init_distributed()
     print(args)
