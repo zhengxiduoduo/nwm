@@ -192,7 +192,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     
     parser.add_argument("--batch_size", type=int, default=64, help="batch size")
-    parser.add_argument("--eval_types", type=str, default='time,rollout,rollout_video', help="evluations")
+    parser.add_argument("--eval_types", type=str, default='time,rollout,rollout_video', help="evaluations")
     parser.add_argument("--gt_dir", type=str, default=None, help="gt directory")
     parser.add_argument("--exp_dir", type=str, default=None, help="experiment directory")
     parser.add_argument("--num_sec_eval", type=int, default=5, help="experiment name")
