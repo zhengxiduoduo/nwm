@@ -127,7 +127,7 @@ def get_dataset_eval(config, dataset_name, predefined_index=True):
 
 class WM_Planning_Evaluator:
     def __init__(self, args):
-        super().__init__()  
+        super().__init__()
         self.args = args
         self.exp = args.exp
         _, _, device, _ = dist.init_distributed()
@@ -215,6 +215,7 @@ class WM_Planning_Evaluator:
         return mu, sigma
         
     def generate_actions(self, dataset_save_output_dir, dataset_name, idxs, obs_image, goal_image, gt_actions, len_traj_pred):
+        # 看不懂，但重要，回头再看
         idx_string = "_".join(map(str, idxs.flatten().int().tolist())) 
         image_plot_dir = os.path.join(dataset_save_output_dir, 'plots')
         os.makedirs(image_plot_dir, exist_ok=True)
@@ -265,7 +266,7 @@ class WM_Planning_Evaluator:
                 sorted_idx = torch.argsort(loss)
                 topk_idx = sorted_idx[:self.topk]
                 topk_action = deltas[topk_idx][:, -1]
-                losses.append(loss[topk_idx[0]].item())   
+                losses.append(loss[topk_idx[0]].item())
                 mu[traj] = topk_action.mean(dim=0)
                 sigma[traj] = topk_action.std(dim=0)
 
@@ -299,6 +300,7 @@ class WM_Planning_Evaluator:
         return pred_actions, pred_yaw
 
     def visualize_trajectories(self, dataset_name, gt_actions, image_plot_dir, i, traj, traj_id, deltas, cur_obs_image, cur_goal_image, preds, loss, topk_idx):
+        # 不懂，后面再慢慢看吧
         img_for_plotting = torch.cat([cur_goal_image[0:1].to(self.device), preds])
         loss_for_plotting = torch.cat((torch.tensor([0]).to(self.device), loss))
         img_name = os.path.join(image_plot_dir, f'idx{traj_id}_iter{i}.png')
@@ -320,6 +322,7 @@ class WM_Planning_Evaluator:
                     )
     
     def autoregressive_rollout(self, obs_image, deltas, rollout_stride):
+        # 拿当前观测去预测下一段未来帧，再把预测结果塞回输入里，继续往后滚动预测
         deltas = deltas.unflatten(1, (-1, rollout_stride)).sum(2)
         preds = []
         curr_obs = obs_image.clone().to(self.device)
@@ -341,11 +344,11 @@ class WM_Planning_Evaluator:
         # Get evaluation name for logging. Should overwrite for specific experiments
         self.eval_name = f'CEM_N{self.args.num_samples}_K{self.args.topk}_RS{self.args.rollout_stride}_rep{self.args.num_repeat_eval}_OPT{self.args.opt_steps}'
         
-    def actions_to_traj(self, actions):
+    def actions_to_traj(self, actions):     # 不太懂，后期慢慢看吧
         positions_xyz = torch.zeros((actions.shape[0], 3))
         positions_xyz[:, :2] = actions
         orientations_quat_wxyz = torch.zeros((actions.shape[0], 4)) # Define identity quaternion
-        orientations_quat_wxyz[:, -1] = 1 # Define identity quaternion
+        orientations_quat_wxyz[:, -1] = 1 # Define identity quaternion  # 四元数顺序有问题吗，这里是 是xyzw [0, 0, 0, 1]. 如果是wxyz该是[1, 0, 0, 0]?
         timestamps = torch.arange(actions.shape[0], dtype=torch.float64)
         traj = PoseTrajectory3D(positions_xyz=positions_xyz, orientations_quat_wxyz=orientations_quat_wxyz, timestamps=timestamps)
         return traj
