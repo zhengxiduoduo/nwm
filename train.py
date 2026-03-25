@@ -101,7 +101,13 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    _, rank, device, _ = init_distributed()
+
+    # 修改开始，device “GPU编号” 和 “PyTorch设备对象” 分开写
+    # _, rank, device, _ = init_distributed()
+    _, rank, device_id, _ = init_distributed()
+    device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+    # 修改结束
+
     # rank = dist.get_rank()
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
@@ -184,7 +190,12 @@ def main(args):
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:
         model = torch.compile(model)
-    model = DDP(model, device_ids=[device])
+
+    # 修改开始
+    # model = DDP(model, device_ids=[device])
+    model = DDP(model, device_ids=[device_id])
+    # 修改结束
+
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
