@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+from vggt.dependency.track_predict import predict_tracks
 from distributed import init_distributed
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -21,6 +22,8 @@ import distributed as dist
 from models import CDiT_models
 from datasets import EvalDataset
 from PIL import Image
+
+from misc import build_geom_from_tracks
 
 
 def save_image(output_file, img, unnormalize_img):
@@ -65,8 +68,33 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
 @torch.no_grad()
 def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, latent_size, device, num_cond, num_goals=1, rel_t=None, progress=False):
     model, diffusion, vae = all_models
-    x = curr_obs.to(device)
+    x = curr_obs.to(device)     # [B, T, 3, H, W]
     y = curr_delta.to(device)
+
+    # 修改开始，用原图 context 帧提 geometry
+    geom_list = []
+    for b in range(x.shape[0]):
+        images_bt = x[b, :num_cond]  # 只用 context 帧
+
+        pred_tracks, pred_vis_scores, pred_confs, _, _ = predict_tracks(images_bt)
+
+        if not torch.is_tensor(pred_tracks):
+            pred_tracks = torch.from_numpy(pred_tracks)
+        if not torch.is_tensor(pred_vis_scores):
+            pred_vis_scores = torch.from_numpy(pred_vis_scores)
+        if not torch.is_tensor(pred_confs):
+            pred_confs = torch.from_numpy(pred_confs)
+
+        pred_tracks = pred_tracks.to(device)
+        pred_vis_scores = pred_vis_scores.to(device)
+        pred_confs = pred_confs.to(device)
+
+        geom_b = build_geom_from_tracks(pred_tracks, pred_vis_scores, pred_confs)
+        geom_list.append(geom_b)
+
+    geom = torch.stack(geom_list, dim=0)  # [B, N_geom, 6]
+
+    # 修改结束
 
     with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
         B, T = x.shape[:2]
@@ -80,7 +108,11 @@ def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, laten
         x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
         z = torch.randn(B*num_goals, 4, latent_size, latent_size, device=device)
         y = y.flatten(0, 1)
-        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)      
+
+        # 修改开始
+        geom = geom.unsqueeze(1).expand(B, num_goals, geom.shape[1], geom.shape[2]).flatten(0, 1)
+        # 修改结束，下面这行新增了一个geom参数
+        model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t, geom=geom)
         samples = diffusion.p_sample_loop(
                 model.forward, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=progress, device=device
         )
@@ -203,7 +235,9 @@ def main(args):
         curr_data_loader = datasets[dataset_name]
         
         for data_iter_step, (idxs, obs_image, gt_image, delta) in enumerate(metric_logger.log_every(curr_data_loader, print_freq, header)):
-            with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+            # 修改开始，去掉最外层的autocast，防止里头的predict_track方法精度不够
+            # with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+            # 修改结束
                 obs_image = obs_image[:, -num_cond:].to(device)
                 gt_image = gt_image.to(device)
                 num_cond = config["context_size"]

@@ -21,6 +21,42 @@ with open("config/data_config.yaml", "r") as f:
     data_config = yaml.safe_load(f)
 
 
+# 修改开始
+def build_geom_from_tracks(tracks, vis, confs, max_tokens=512):
+    """
+    track:  [Tc, Nq, 2]
+    vis:    [Tc, Nq]
+    confs:  [Nq]
+
+    return:
+        geom: [N_geom, 6]
+                = [x_last, y_last, dx, dy, mean_vis, conf]
+    """
+
+    # 下面要计算，转到float
+    tracks = tracks.float()
+    vis = vis.float()
+    confs = confs.float()
+
+    # temporal-aware features
+    last_xy = tracks[-1]                        # [Nq, 2]
+    first_xy = tracks[0]                        # [Nq, 2]
+    delta_xy = last_xy - first_xy               # [Nq, 2]
+    mean_vis = vis.mean(dim=0).unsqueeze(-1)    # [Nq, 1]
+    confs_col = confs.unsqueeze(-1)             # [Nq, 1]
+
+    geom = torch.cat([last_xy, delta_xy, mean_vis, confs_col], dim=-1)  # [Nq, 6]
+
+    # top-k by confidence
+    if geom.shape[0] > max_tokens:
+        _, idx = torch.topk(confs, k=max_tokens)
+        geom = geom[idx]
+
+    return geom
+
+# 修改结束
+
+
 def get_action_torch(diffusion_output, action_stats):
     ndeltas = diffusion_output
     ndeltas = ndeltas.reshape(ndeltas.shape[0], -1, 2)
@@ -235,3 +271,4 @@ unnormalize = transforms.Normalize(
     mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
     std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
 )
+

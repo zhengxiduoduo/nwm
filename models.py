@@ -76,6 +76,24 @@ class ActionEmbedder(nn.Module):
     def forward(self, xya):
         return torch.cat([self.x_emb(xya[...,0:1]), self.y_emb(xya[...,1:2]), self.angle_emb(xya[...,2:3])], dim=-1)
 
+# 修改开始
+class GeometryEmbedder(nn.Module):
+    """
+    Embeds geometry tokens, e.g. [x_last, y_last, dx, dy, mean_vis, conf]
+    geom:   [B, N_geom, input_dim]
+    out:    [B, N_geom, hidden_size]
+    """
+    def __init__(self, input_dim, hidden_size):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_size,bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+    def forward(self, geom):
+        return self.mlp(geom)
+# 修改结束
+
 #################################################################################
 #                                 Core CDiT Model                                #
 #################################################################################
@@ -91,9 +109,26 @@ class CDiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm_cond = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.cttn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, add_bias_kv=True, bias=True, batch_first=True, **block_kwargs)
+
+        # 修改开始，增加：geometry cross-attention
+        self.norm_geom = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_geom_q = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.gcttn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, add_bias_kv=True, bias=True, batch_first=True, **block_kwargs)
+
+
+        # 修改结束
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 11 * hidden_size, bias=True)
+            # nn.Linear(hidden_size, 11 * hidden_size, bias=True)
+            # 原本的11组调制参数，分别服务于：
+            # self-attn: 3组
+            # x_cond cross-attn: 5组
+            # mlp: 3组
+            # 修改开始，因为增加了5组（geometry cross-attn: shift_ca_geom, scale_ca_geom, shift_ca_x_geom, scale_ca_x_geom, gate_ca_geom)
+            nn.Linear(hidden_size, 16 * hidden_size, bias=True)
+
+            #修改结束
         )
 
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -101,13 +136,38 @@ class CDiTBlock(nn.Module):
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
 
-    def forward(self, x, c, x_cond):
-        shift_msa, scale_msa, gate_msa, shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(11, dim=1)
+    def forward(self, x, c, x_cond, geom_tokens=None):
+        #修改开始，增加：cross-attention to geometry
+        (shift_msa, scale_msa, gate_msa,
+         shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x,
+         shift_ca_geom, scale_ca_geom, shift_ca_x_geom, scale_ca_x_geom, gate_ca_geom,
+         shift_mlp, scale_mlp, gate_mlp
+         ) = self.adaLN_modulation(c).chunk(16, dim=1)  # 把维度从11改到16
+
+        # 1. self-attention
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+        # 2. cross-attention to x_cond
         x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
         x = x + gate_ca_x.unsqueeze(1) * self.cttn(query=modulate(self.norm2(x), shift_ca_x, scale_ca_x), key=x_cond_norm, value=x_cond_norm, need_weights=False)[0]
+
+        # 3. 新增 cross-attention to geometry
+        if geom_tokens is not None:
+            geom_norm = modulate(self.norm_geom(geom_tokens), shift_ca_geom, scale_ca_geom)
+            x = x + gate_ca_geom.unsqueeze(1) * self.gcttn(
+                query=modulate(self.norm_geom_q(x), shift_ca_x_geom, scale_ca_x_geom),
+                key=geom_norm,
+                value=geom_norm,
+                need_weights=False
+            )[0]
+
+        # 4. mlp
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
         return x
+
+
+
+        #修改结束
 
 class FinalLayer(nn.Module):
     """
@@ -155,6 +215,10 @@ class CDiT(nn.Module):
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = ActionEmbedder(hidden_size)
+
+        # 修改开始
+        self.geometry_embedder = GeometryEmbedder(input_dim=6, hidden_size=hidden_size)
+        # 修改结束
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(self.context_size + 1, num_patches, hidden_size), requires_grad=True) # for context and for predicted frame
         self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
@@ -196,7 +260,14 @@ class CDiT(nn.Module):
         
         nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
-            
+
+        # 修改开始
+        # Initialize geometry embedding MLP:
+        nn.init.normal_(self.geometry_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.geometry_embedder.mlp[2].weight, std=0.02)
+
+        # 修改结束
+
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -223,23 +294,43 @@ class CDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, x_cond, rel_t):
+    def forward(self, x, t, y, x_cond, rel_t, geom=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed[self.context_size:]
+
+        """修改开始
+        y:      (N, 3) 这儿的第二维度再仔细看看，注意一下
+        x_cond: (N, T_cond, C, H, W)
+        rel_t:  (N,)
+        geom:   (B, N_geom, 6) or None, 这里不是B，而是(N, N_geom, 6)，因为经过训练后
+        unsqueeze -> expand -> flatten，传进model的geom应该和x_start, y, rel_t一样，
+        这里的 N 其实已经是 B*num_goals 之后的 batch，而不是原始的 batch B
+        """
+        x = self.x_embedder(x) + self.pos_embed[self.context_size:]         # [N, num_patches, D]
+        # [N, T_cond, num_patches, D]
         x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
-        x_cond = x_cond.flatten(1, 2)
+        x_cond = x_cond.flatten(1, 2)   # [N, T_cond*num_patches, D]
         t = self.t_embedder(t[..., None])
         y = self.y_embedder(y) 
         time_emb = self.time_embedder(rel_t[..., None])
         c = t + time_emb + y # if training on unlabeled data, dont add y.
 
+
+        # 修改开始
+        geom_tokens = None
+        if geom is not None:
+            geom_tokens = self.geometry_embedder(geom)
+        # 修改结束
+
         for block in self.blocks:
-            x = block(x, c, x_cond)
+            # x = block(x, c, x_cond)
+            # 修改开始，增加一维geom_tokens
+            x = block(x, c, x_cond, geom_tokens)
+            # 修改结束
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         return x

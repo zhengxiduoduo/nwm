@@ -24,6 +24,7 @@ import logging
 import os
 import matplotlib.pyplot as plt 
 import yaml
+from vggt.dependency.track_predict import predict_tracks
 
 
 import torch.distributed as dist
@@ -37,6 +38,7 @@ from models import CDiT_models
 from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
+from misc import build_geom_from_tracks
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -86,6 +88,7 @@ def create_logger(logging_dir):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
     return logger
+
 
 #################################################################################
 #                                  Training Loop                                #
@@ -273,6 +276,40 @@ def main(args):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             rel_t = rel_t.to(device, non_blocking=True)
+            B, T = x.shape[:2]
+
+            # 修改开始（用原图的 context 帧提 geometry / tracks）
+            # x: [B, T, 3, H, W]
+            with torch.no_grad():
+                geom_list = []
+                # 修改提醒：想想优化（是否支持batch化geometry extraction；是否离线缓存tracks；是否只在dataset prepocessing阶段算一次）
+                for b in range(B):
+
+                    images_bt = x[b, :num_cond]  # 只取 context, 不取全部T [:num_cond, 3, H, W]
+                    # vggt 输出 tracks
+                    pred_tracks, pred_vis_scores, pred_confs, _, _ = predict_tracks(images_bt)
+
+                    # 兼容 numpy / tensor
+                    if not torch.is_tensor(pred_tracks):
+                        pred_tracks = torch.from_numpy(pred_tracks)
+                    if not torch.is_tensor(pred_vis_scores):
+                        pred_vis_scores = torch.from_numpy(pred_vis_scores)
+                    if not torch.is_tensor(pred_confs):
+                        pred_confs = torch.from_numpy(pred_confs)
+
+                    pred_tracks = pred_tracks.to(device)            # 位置
+                    pred_vis_scores = pred_vis_scores.to(device)    # 每帧是否可见
+                    pred_confs = pred_confs.to(device)              # 整个track的质量（没有这一维容易被noisy points干扰）
+
+                    # 这里要做一个 geometry feature 组装
+                    geom_b = build_geom_from_tracks(pred_tracks, pred_vis_scores, pred_confs)
+                    # 目标：[N_geom, D] 这个D目前先定为4，后面看情况改成6（已加temporal）
+
+                    geom_list.append(geom_b)
+
+                geom = torch.stack(geom_list, dim=0)     # [B, N_geom, D]
+
+            # 修改结束
             
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 with torch.no_grad():
@@ -288,9 +325,16 @@ def main(args):
                 x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
                 y = y.flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
-                
+
+                # 修改开始,每个 sample 的 geom 要复制给它的多个 goal
+                geom = geom.unsqueeze(1).expand(B, num_goals, geom.shape[1], geom.shape[2]).flatten(0, 1)
+                # 修改结束
+
                 t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
-                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
+
+                # 修改开始
+                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t, geom=geom)
+                # 修改结束
                 loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
 
