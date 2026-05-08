@@ -23,6 +23,7 @@ with open("config/data_config.yaml", "r") as f:
 
 # 修改开始
 def build_geom_from_tracks(tracks, vis, confs, max_tokens=512):
+    """!!! 把vggt的尺寸给它调整回nvw的"""
     """
     track:  [Tc, Nq, 2]
     vis:    [Tc, Nq]
@@ -32,11 +33,27 @@ def build_geom_from_tracks(tracks, vis, confs, max_tokens=512):
         geom: [N_geom, 6]
                 = [x_last, y_last, dx, dy, mean_vis, conf]
     """
-
     # 下面要计算，转到float
     tracks = tracks.float()
     vis = vis.float()
     confs = confs.float()
+
+    # nwm原始尺寸
+    img_w = 320.0
+    img_h = 240.0
+
+    # 从 tracks 自动估计 VGGT 内部坐标尺寸
+    ref_w = tracks[..., 0].max().item()
+    ref_h = tracks[..., 1].max().item()
+
+    ref_w = max(ref_w, 1e-6)
+    ref_h = max(ref_h, 1e-6)
+
+    # 把 tracks 映射回原图坐标系
+    tracks[..., 0] = tracks[..., 0] * (img_w / ref_w)
+    tracks[..., 1] = tracks[..., 1] * (img_h / ref_h)
+
+
 
     # temporal-aware features
     last_xy = tracks[-1]                        # [Nq, 2]

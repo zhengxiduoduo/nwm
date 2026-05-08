@@ -8,6 +8,18 @@
 # NoMaD, GNM, ViNT: https://github.com/robodhruv/visualnav-transformer
 # --------------------------------------------------------
 
+# 修改开始 加 LoRA
+
+import math
+# import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# 修改结束 加 LoRA
+
+
+
 from isolated_nwm_infer import model_forward_wrapper
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
@@ -39,6 +51,78 @@ from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
 from misc import build_geom_from_tracks
+
+
+# 修改开始 加loRA
+class LoRALinear(nn.Module):
+    """
+    Wrap an existing nn.Linear with LoRA.
+    Original weight/bias are frozen.
+    Only lora_A and lora_B are trainable.
+    """
+
+    def __init__(self, base_layer: nn.Linear, rank=8, alpha=16, dropout=0.0):
+        super().__init__()
+
+        if not isinstance(base_layer, nn.Linear):
+            raise TypeError(f"LoRALinear only supports nn.Linear, got {type(base_layer)}")
+
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank if rank > 0 else 1.0
+
+        # keep original linear
+        self.base_layer = base_layer
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        if rank > 0:
+            # LoRA params
+            self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
+
+            # init: A kaiming, B zero -> start from no-op
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+
+    def forward(self, x):
+        base_out = self.base_layer(x)
+
+        if self.rank <= 0:
+            return base_out
+
+        x_d = self.dropout(x)
+        # (..., in_features) -> (..., rank) -> (..., out_features)
+        lora_out = F.linear(F.linear(x_d, self.lora_A), self.lora_B)
+        return base_out + self.scaling * lora_out
+
+########### LoRA 的 help 函数 ###########
+
+def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0, verbose=False):
+    """
+    递归 替换所有 Linear 为 LoRA
+    Recursively replace all nn.Linear in module with LoRALinear.
+    """
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
+            if verbose:
+                print(f"[LoRA] Replaced Linear layer: {name}")
+        else:
+            replace_linear_with_lora(child, rank=rank, alpha=alpha, dropout=dropout, verbose=verbose)
+
+
+
+# 修改结束 加loRA
+
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -137,64 +221,191 @@ def main(args):
 
     assert config['image_size'] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     num_cond = config['context_size']
-    model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4).to(device)
-    
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+
+    # ===================== LoRA修改开始：LoRA 微调流程 =====================
+    # 关键顺序：
+    #   1）在CPU上建模型
+    #   2）加载 base 预训练 ckpt (strict=False, 容忍新加的 geometry 模块)
+    #   3）注入LoRA
+    #   4）冻结非可训练参数
+    #   5）.to(device)
+    #   6）deepcopy 出 EMA
+    #   7）optimizer 只接收 requires_grad=True 的参数
+    #   8）（如有）加载 LoRA-only 续训 ckpt
+    #   9）DDP, find_unused_parameters=True
+
+    # 1 建模型（先放 CPU）
+    model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4)
+
+    # 2 加载 base 预训练 ckpt（在注入 LoRA 之前）
+    base_ckpt_path = config.get('from_checkpoint', 0)
+
+    if base_ckpt_path:
+        print("Load BASE pretrained checkpoint from", base_ckpt_path)
+        base_ckpt = torch.load(base_ckpt_path, map_locaation='cpu', weights_only=False)
+        # 优先用 ema 权重做 base，效果通常更好；没有就用 model
+        base_state = base_ckpt.get('ema', base_ckpt.get('model'))
+        base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
+        res = model.load_state_dict(base_state, strict=False)
+        print(f"[Base ckpt] missing keys: {len(res.missing_keys)}, unexpected: {len(res.unexpected_keys)}")
+        if rank == 0:   # real logger
+            print("     missing (新加板块，应当包含 geometry/gcttn/norm_geom/adaLN_modulation):")
+            for k in res.missing_keys[:20]:
+                print("         ", k)
+            print("     unexpected:")
+            for k in res.unexpected_keys[:20]:
+                print("         ", k)
+
+
+    # 3 注入 LoRA
+    lora_rank = int(config.get('lora_rank', 8))
+    lora_alpha = int(config.get('lora_alpha', 16))
+    lora_dropout = float(config.get('lora_dropout', 0.0))
+    replace_linear_with_lora(model, rank=lora_rank, alpha=lora_alpha,
+                             dropout=lora_dropout, verbose=False)
+    print(f"[LoRA] injected. rank={lora_rank}, alpha={lora_alpha}, dropout={lora_dropout}")
+
+    # 4 冻结非可训练参数
+    # 可训练：LoRA 参数 + 新加的 geometry 板块 + cross-attn 到 geometry 的 norm / 层
+    #        + adaLN_modulation
+    # adaLN_modulation 因为从 11 → 16 维度变了，必须重训，整层放开
+    trainable_keywords = ("lora_A", "lora_B",
+                          "geometry_embedder",
+                          "gcttn",
+                          "norm_geom",
+                          "adaLN_modulation",
+                          # final_layer 的 adaLN 也归在adaLN_modulation 里，已包含
+                          )
+    for n, p in model.named_parameters():
+        p.requires_grad = any(k in n for k in trainable_keywords)
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"[LoRA] trainable params: {n_trainable:,} / total {n_total:,}"
+          f"({100.0 * n_trainable / n_total:.2f}%)")
+
+    # 5 搬到 device
+    model = model.to(device)
+
+    # 6 EMA (deepcopy 之后再 to device)
+    ema = deepcopy(model).to(device)
     requires_grad(ema, False)
-    
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+
+    # 7 optimizer 只接收可训练参数
     lr = float(config.get('lr', 1e-4))
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0)
 
     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
     if bfloat_enable:
         scaler = torch.amp.GradScaler()
 
-    # load existing checkpoint
+
+    # 8 (如有)加载LoRA-only 续训 ckpt
+    # 注意：这里加载的是 LoRA fine-tune 的 ckpt，不是 base ckpt
+    # base ckpt 通过 config['from_checkpoint] 在第2步加载
     latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
-    print('Searching for model from ', checkpoint_dir)
+    print('Searching for LoRA checkpoint from ', checkpoint_dir)
     start_epoch = 0
     train_steps = 0
-    if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
-        if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
-            raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
-        latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
-        print("Loading model from ", latest_path)
-        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False) 
+    if os.path.isfile(latest_path):
+        print("Loading LoRA fine-tune checkpoint from ", latest_path)
+        latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
 
+        # LoRA ckpt 只存了可训练参数，所以 strict=False
         if "model" in latest_checkpoint:
-            model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
-            res = model.load_state_dict(model_ckp, strict=True)
-            print("Loading model weights", res)
+            model_ckp = {k.replace('_orig_mod.', ''): v for k, v in latest_checkpoint['model'].items()}
+            res = model.load_state_dict(model_ckp, strict=False)
+            print(f"[Resume] model: missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
 
-            model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
-            res = ema.load_state_dict(model_ckp, strict=True)
-            print("Loading EMA model weights", res)
-        else:
-            update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+            ema_ckp = {k.replace('_orig_mod.', ''): v for k, v in latest_checkpoint['ema'].items()}
+            res = ema.load_state_dict(ema_ckp, strict=False)
+            print(f"[Resume] ema: missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
 
         if "opt" in latest_checkpoint:
-            opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
-            opt.load_state_dict(opt_ckp)
+            opt.load_state_dict(latest_checkpoint['opt'])
             print("Loading optimizer params")
-        
+
         if "epoch" in latest_checkpoint:
             start_epoch = latest_checkpoint['epoch'] + 1
-        
         if "train_steps" in latest_checkpoint:
-            train_steps = latest_checkpoint["train_steps"]
-        
-        if "scaler" in latest_checkpoint:
+            train_steps = latest_checkpoint['train_steps']
+        if "scaler" in latest_checkpoint and bfloat_enable:
             scaler.load_state_dict(latest_checkpoint["scaler"])
-        
+
+    else:
+        # 没有续训 ckpt：用当前（已加载 base + 注入 LoRA 的）模型初始化 EMA
+        update_ema(ema, model, decay=0)
+
     # ~40% speedup but might leads to worse performance depending on pytorch version
     if args.torch_compile:
         model = torch.compile(model)
 
-    # 修改开始
-    # model = DDP(model, device_ids=[device])
-    model = DDP(model, device_ids=[device_id])
-    # 修改结束
+    # 9 DDP, find_unused_parameters=True (因为有冻结参数)
+    model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
+
+    #=
+
+
+    # ===================== LoRA修改结束：LoRA 微调流程 =====================
+
+
+    # ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    # requires_grad(ema, False)
+    #
+    # # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
+    # lr = float(config.get('lr', 1e-4))
+    # opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
+    #
+    # bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
+    # if bfloat_enable:
+    #     scaler = torch.amp.GradScaler()
+    #
+    # # load existing checkpoint
+    # latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
+    # print('Searching for model from ', checkpoint_dir)
+    # start_epoch = 0
+    # train_steps = 0
+    # if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
+    #     if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
+    #         raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
+    #     latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
+    #     print("Loading model from ", latest_path)
+    #     latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
+    #
+    #     if "model" in latest_checkpoint:
+    #         model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
+    #         res = model.load_state_dict(model_ckp, strict=True)
+    #         print("Loading model weights", res)
+    #
+    #         model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
+    #         res = ema.load_state_dict(model_ckp, strict=True)
+    #         print("Loading EMA model weights", res)
+    #     else:
+    #         update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+    #
+    #     if "opt" in latest_checkpoint:
+    #         opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
+    #         opt.load_state_dict(opt_ckp)
+    #         print("Loading optimizer params")
+    #
+    #     if "epoch" in latest_checkpoint:
+    #         start_epoch = latest_checkpoint['epoch'] + 1
+    #
+    #     if "train_steps" in latest_checkpoint:
+    #         train_steps = latest_checkpoint["train_steps"]
+    #
+    #     if "scaler" in latest_checkpoint:
+    #         scaler.load_state_dict(latest_checkpoint["scaler"])
+    #
+    # # ~40% speedup but might leads to worse performance depending on pytorch version
+    # if args.torch_compile:
+    #     model = torch.compile(model)
+    #
+    # # 修改开始
+    # # model = DDP(model, device_ids=[device])
+    # model = DDP(model, device_ids=[device_id])
+    # # 修改结束
 
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -386,14 +597,47 @@ def main(args):
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
+                    # ===================== LoRA修改开始：LoRA ckpt 只存可训练参数 =====================
+                    # 用一个外部 set 收集所有 requires_grad=True 的参数名
+                    # 注意：DDP 包装后，参数前缀是 module., 所以从 model.module 取
+                    raw_model = model.module if hasattr(model, "module") else model
+                    raw_model_for_keys = getattr(raw_model, "_orig_mod", raw_model) # 兼容 torch.compile
+
+                    trainable_names = {
+                        n for n, p in raw_model_for_keys.named_parameters() if p.requires_grad
+                    }
+
+                    def _filter_trainable(state_dict, names):
+                        out = {}
+                        for k, v in state_dict.items():
+                            k_norm = k.replace('_orig_mod.', '')
+                            if k_norm in names:
+                                out[k] = v
+                        return out
+
+                    full_model_sd = raw_model.state_dict()
+                    full_ema_sd = ema.state_dict()
+
                     checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
+                        "model": _filter_trainable(full_model_sd, trainable_names),
+                        "ema": _filter_trainable(full_ema_sd, trainable_names),
                         "opt": opt.state_dict(),
                         "args": args,
                         "epoch": epoch,
-                        "train_steps": train_steps
+                        "train_steps": train_steps,
+                        "lora_rank": lora_rank,
+                        "lora_alpha": lora_alpha,
                     }
+
+                    # checkpoint = {
+                    #     "model": model.module.state_dict(),
+                    #     "ema": ema.state_dict(),
+                    #     "opt": opt.state_dict(),
+                    #     "args": args,
+                    #     "epoch": epoch,
+                    #     "train_steps": train_steps
+                    # }
+                    # ===================== LoRA修改结束：LoRA ckpt 只存可训练参数 =====================
                     if bfloat_enable:
                         checkpoint.update({"scaler": scaler.state_dict()})
                     checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
