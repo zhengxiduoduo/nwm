@@ -191,16 +191,52 @@ def main(args):
     print("loading")
     model_lst = (None, None, None)
     if not args.gt:
+        # ========================= 修改开始：LoRA 加载流程 =========================
+        from misc import load_model_for_inference
+
+        # base ckpt: NWM 原作者预训练权重（必须给）
+        # lora ckpt: LoRA 微调出来的 ckpt
+        # 两个路径都从 config 里读，这样切换实验只改 yaml 不改代码
+        base_ckpt_path = config.get('from_checkpoint', None)
+        lora_ckpt_path = f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar'
+
+        # LoRA 超参数必须与训练时一致，否则参数 shape 对不上
+        lora_rank = int(config.get('lora_rank', 8))
+        lora_alpha = int(config.get('lora_alpha', 16))
+        lora_dropout = float(config.get('lora_dropout', 0.0))
+
+        # 1 在 CPU 上建模
         model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4)
-        ckp = torch.load(f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
-        print(model.load_state_dict(ckp["ema"], strict=True))
-        model.eval()
-        model.to(device)
-        model = torch.compile(model)
+
+        # 2 load_model_for_inference 内部会：
+        # 加载 base -> 注入 LoRA -> 加载 LoRA ckpt -> .to(device).eval()
+        model = load_model_for_inference(
+            model,
+            base_ckpt_path=base_ckpt_path,
+            lora_ckpt_path=lora_ckpt_path,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            device=device,
+            verbose=True,
+        )
+
+        model = torch.copile(model)
         diffusion = create_diffusion(str(250))
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=False)
         model_lst = (model, diffusion, vae)
+        # ========================= 修改结束：LoRA 加载流程 =========================
+        # model = CDiT_models[config['model']](context_size=num_cond, input_size=latent_size, in_channels=4)
+        # ckp = torch.load(f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
+        # print(model.load_state_dict(ckp["ema"], strict=True))
+        # model.eval()
+        # model.to(device)
+        # model = torch.compile(model)
+        # diffusion = create_diffusion(str(250))
+        # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=False)
+        # model_lst = (model, diffusion, vae)
 
     # Loading Datasets
     dataset_names = args.datasets.split(',')

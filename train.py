@@ -343,10 +343,6 @@ def main(args):
 
     # 9 DDP, find_unused_parameters=True (因为有冻结参数)
     model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
-
-    #=
-
-
     # ===================== LoRA修改结束：LoRA 微调流程 =====================
 
 

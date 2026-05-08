@@ -183,16 +183,47 @@ class WM_Planning_Evaluator:
         
         # Loading Model
         print("loading")
+
+        # ==================== 修改开始：LoRA 加载流程 ====================
+        from misc import load_model_for_inference
+
+        base_ckpt_path = self.config.get('from_checkpoint', None)
+        lora_ckpt_path = f'{self.config["results_dir"]}/{self.config["run_name"]}/checkpoints/{args.ckp}.pth.tar'
+
+        lora_rank = int(self.config.get('lora_rank', 8))
+        lora_alpha = int(self.config.get('lora_alpha', 16))
+        lora_dropout = float(self.config.get('lora_dropout', 0.0))
+
         model = CDiT_models[self.config['model']](
             context_size=self.num_cond,
             input_size=latent_size,
         )
 
-        ckp = torch.load(f'{self.config["results_dir"]}/{self.config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
-        model.load_state_dict(ckp["ema"], strict=True)
-        model.eval()
-        model.to(self.device)
+        model = load_model_for_inference(
+            model,
+            base_ckpt_path=base_ckpt_path,
+            lora_ckpt_path=lora_ckpt_path,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            device=self.device,
+            verbose=True,
+        )
         self.model = torch.compile(model)
+        # ==================== 修改结束：LoRA 加载流程 ====================
+
+
+        # model = CDiT_models[self.config['model']](
+        #     context_size=self.num_cond,
+        #     input_size=latent_size,
+        # )
+        #
+        # ckp = torch.load(f'{self.config["results_dir"]}/{self.config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
+        # model.load_state_dict(ckp["ema"], strict=True)
+        # model.eval()
+        # model.to(self.device)
+        # self.model = torch.compile(model)
+
         self.diffusion = create_diffusion(str(250))
         self.vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
         self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device], find_unused_parameters=False)

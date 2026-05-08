@@ -289,3 +289,111 @@ unnormalize = transforms.Normalize(
     std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
 )
 
+# =============================== 修改开始：LoRA 推理加载工具 ===============================
+import math
+import torch.nn as nn
+import torch.nn.functional as F
+
+class LoRALinear(nn.Module):
+    """
+    与 train.py 里的 LoRALinear 完全一致
+    单独写一份是为了让推理脚本不依赖 train.py 的 import 链（train.py 顶部
+    会 import vggt 等重量级依赖，推理时不一定都需要）
+    """
+    def __init__(self,base_layer: nn.Linear, rank=8, alpha=16, dropout=0.0):
+        super().__init__()
+        if not isinstance(base_layer, nn.Linear):
+            raise TypeError(f"LoRALinear only supports nn.Linear, got {type(base_layer)}")
+        self.in_features = base_layer.in_features
+        self.out_features = base_layer.out_features
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank if rank > 0 else 1.0
+        self.base_layer = base_layer
+        self.base_layer.weight.requires_grad = False
+        if self.base_layer.bias is not None:
+            self.base_layer.bias.requires_grad = False
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        if rank > 0:
+            self.lora_A = nn.Parameter(torch.zeros(rank, self.in_features))
+            self.lora_B = nn.Parameter(torch.zeros(self.out_features, rank))
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+
+    def forward(self, x):
+        base_out = self.base_layer(x)
+        if self.rank <= 0:
+            return base_out
+        x_d = self.dropout(x)
+        lora_out = F.linear(F.linear(x_d, self.lora_A), self.lora_B)
+        return base_out + self.scaling * lora_out
+
+def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0):
+    """ 递归把所有 nn.Linear 替换成 LoRALinear（与 train.py 同名函数一致）"""
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
+        else:
+            replace_linear_with_lora(child, rank=rank, alpha=alpha, dropout=dropout)
+
+def load_model_for_inference(model, base_ckpt_path, lora_ckpt_path,
+                             lora_rank=8, lora_alpha=16, lora_dropout=0.0,
+                             device='cuda', verbose=True):
+    """
+    推理时加载 LoRA 微调后的模型
+    顺序与训练对齐：
+        1）加载 base 预训练 ckpt（strict=False，容忍新加的 geometry 模块）
+        2）注入 LoRA
+        3）加载 LoRA fine-tune ckpt（strict=False，因为只存了可训练参数）
+        4）.to(device).eval()
+
+    Args:
+        model: 已实例化的 CDiT 模型（在 CPU 上）
+        base_ckpt_path: NWM 原作者预训练 ckpt 路径；None/'' 表示跳过（不推荐）
+        lora_ckpt_path: 你的 LoRA 微调 ckpt 路径（训练阶段保存的 latest.pth.tar 或者 step）
+        lora_rank/alpha/dropout: 必须与训练时一致
+        device: 加载到哪个 device
+
+    Returns:
+        model（eval 模式，在 device 上）
+    """
+
+    # 1 加载 base ckpt
+    if base_ckpt_path:
+        if verbose:
+            print(f"[Inference] Loading BASE ckpt from {base_ckpt_path}")
+        base_ckpt = torch.load(base_ckpt_path, map_location='cpu', weights_only=False)
+        base_state = base_ckpt.get('ema', base_ckpt.get('model'))
+        base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
+        res = model.load_state_dict(base_state, strict=False)
+        if verbose:
+            print(f"[Inference] base: missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
+
+    # 2 注入 LoRA（顺序必须和训练时一致）
+    replace_linear_with_lora(model, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
+    if verbose:
+        print(f"[Inference] LoRA injected. rank={lora_rank}, alpha={lora_alpha}")
+
+    # 3 加载 LoRA fine-tune ckpt
+    if lora_ckpt_path:
+        if verbose:
+            print(f"[Inference] Loading LoRA ckpt from {lora_ckpt_path}")
+        lora_ckpt = torch.load(lora_ckpt_path, map_location='cpu', weights_only=False)
+        # 推理优先用 ema 权重（更稳定）；没有就用 model
+        lora_state = lora_ckpt.get('ema', lora_ckpt.get('model'))
+        lora_state = {k.replace('_orig_mod.', ''): v for k, v in lora_state.items()}
+        res = model.load_state_dict(lora_state, strict=False)
+        if verbose:
+            print(f"[Inference] lora: missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
+            # missing 应该是大量 base 参数（LoRA ckpt 里没存），这是正常的
+            # 只要 unexpected 是0，就说明 LoRA ckpt 里的所有参数都成功加载了
+
+    # 4 准备推理
+    model.eval()
+    model = model.to(device)
+    return model
+
+# =============================== 修改结束：LoRA 推理加载工具 ===============================
