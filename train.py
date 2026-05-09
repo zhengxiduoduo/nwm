@@ -242,11 +242,37 @@ def main(args):
 
     if base_ckpt_path:
         print("Load BASE pretrained checkpoint from", base_ckpt_path)
-        base_ckpt = torch.load(base_ckpt_path, map_locaation='cpu', weights_only=False)
+        base_ckpt = torch.load(base_ckpt_path, map_location='cpu', weights_only=False)
         # 优先用 ema 权重做 base，效果通常更好；没有就用 model
+
+        # xiugaikaishi lora tongshi 11 -> 16
+        # base_state = base_ckpt.get('ema', base_ckpt.get('model'))
+        # base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
+        # res = model.load_state_dict(base_state, strict=False)
+
         base_state = base_ckpt.get('ema', base_ckpt.get('model'))
         base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
-        res = model.load_state_dict(base_state, strict=False)
+
+        # === 新增：过滤掉 shape 不匹配的 key（adaLN_modulation 等改造层）===
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped = []
+        for k, v in base_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                filtered_state[k] = v
+            else:
+                skipped.append((k, tuple(v.shape), tuple(model_state[k].shape) if k in model_state else None))
+
+        print(f"[Base ckpt] skipped {len(skipped)} keys due to shape mismatch (expected for adaLN_modulation):")
+        for k, ckpt_shape, model_shape in skipped[:10]:
+            print(f"    {k}: ckpt {ckpt_shape} vs model {model_shape}")
+        if len(skipped) > 10:
+            print(f"    ... and {len(skipped) - 10} more")
+
+        res = model.load_state_dict(filtered_state, strict=False)
+
+        # xiugaijieshu
+
         print(f"[Base ckpt] missing keys: {len(res.missing_keys)}, unexpected: {len(res.unexpected_keys)}")
         if rank == 0:   # real logger
             print("     missing (新加板块，应当包含 geometry/gcttn/norm_geom/adaLN_modulation):")
