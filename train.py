@@ -15,18 +15,18 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # 修改结束 加 LoRA
-
 
 
 from isolated_nwm_infer import model_forward_wrapper
 import torch
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 import matplotlib
+
 matplotlib.use('Agg')
 from collections import OrderedDict
 from copy import deepcopy
@@ -34,9 +34,13 @@ from time import time
 import argparse
 import logging
 import os
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
 import yaml
-from vggt.dependency.track_predict import predict_tracks
+
+# === 修改开始：不再在线跑 VGGT，删除 predict_tracks / build_geom_from_tracks 的 import ===
+# from vggt.dependency.track_predict import predict_tracks       # 已离线缓存，不再需要
+# from misc import build_geom_from_tracks                         # geom 组装移到 dataset 里
+# === 修改结束 ===
 
 
 import torch.distributed as dist
@@ -50,7 +54,6 @@ from models import CDiT_models
 from diffusion import create_diffusion
 from datasets import TrainingDataset
 from misc import transform
-from misc import build_geom_from_tracks
 
 
 # 修改开始 加loRA
@@ -104,6 +107,7 @@ class LoRALinear(nn.Module):
         lora_out = F.linear(F.linear(x_d, self.lora_A), self.lora_B)
         return base_out + self.scaling * lora_out
 
+
 ########### LoRA 的 help 函数 ###########
 
 def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0, verbose=False):
@@ -118,7 +122,6 @@ def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0, v
                 print(f"[LoRA] Replaced Linear layer: {name}")
         else:
             replace_linear_with_lora(child, rank=rank, alpha=alpha, dropout=dropout, verbose=verbose)
-
 
 
 # 修改结束 加loRA
@@ -186,7 +189,7 @@ def main(args):
 
     # Setup DDP:
 
-    # 修改开始，device “GPU编号” 和 “PyTorch设备对象” 分开写
+    # 修改开始，device "GPU编号" 和 "PyTorch设备对象" 分开写
     # _, rank, device, _ = init_distributed()
     _, rank, device_id, _ = init_distributed()
     device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
@@ -199,11 +202,11 @@ def main(args):
     with open("config/eval_config.yaml", "r") as f:
         default_config = yaml.safe_load(f)
     config = default_config
-    
+
     with open(args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
-    
+
     # Setup an experiment folder:
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
     experiment_dir = f"{config['results_dir']}/{config['run_name']}"  # Create an experiment folder
@@ -242,46 +245,19 @@ def main(args):
 
     if base_ckpt_path:
         print("Load BASE pretrained checkpoint from", base_ckpt_path)
-        base_ckpt = torch.load(base_ckpt_path, map_location='cpu', weights_only=False)
+        base_ckpt = torch.load(base_ckpt_path, map_locaation='cpu', weights_only=False)
         # 优先用 ema 权重做 base，效果通常更好；没有就用 model
-
-        # xiugaikaishi lora tongshi 11 -> 16
-        # base_state = base_ckpt.get('ema', base_ckpt.get('model'))
-        # base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
-        # res = model.load_state_dict(base_state, strict=False)
-
         base_state = base_ckpt.get('ema', base_ckpt.get('model'))
         base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
-
-        # === 新增：过滤掉 shape 不匹配的 key（adaLN_modulation 等改造层）===
-        model_state = model.state_dict()
-        filtered_state = {}
-        skipped = []
-        for k, v in base_state.items():
-            if k in model_state and model_state[k].shape == v.shape:
-                filtered_state[k] = v
-            else:
-                skipped.append((k, tuple(v.shape), tuple(model_state[k].shape) if k in model_state else None))
-
-        print(f"[Base ckpt] skipped {len(skipped)} keys due to shape mismatch (expected for adaLN_modulation):")
-        for k, ckpt_shape, model_shape in skipped[:10]:
-            print(f"    {k}: ckpt {ckpt_shape} vs model {model_shape}")
-        if len(skipped) > 10:
-            print(f"    ... and {len(skipped) - 10} more")
-
-        res = model.load_state_dict(filtered_state, strict=False)
-
-        # xiugaijieshu
-
+        res = model.load_state_dict(base_state, strict=False)
         print(f"[Base ckpt] missing keys: {len(res.missing_keys)}, unexpected: {len(res.unexpected_keys)}")
-        if rank == 0:   # real logger
+        if rank == 0:  # real logger
             print("     missing (新加板块，应当包含 geometry/gcttn/norm_geom/adaLN_modulation):")
             for k in res.missing_keys[:20]:
                 print("         ", k)
             print("     unexpected:")
             for k in res.unexpected_keys[:20]:
                 print("         ", k)
-
 
     # 3 注入 LoRA
     lora_rank = int(config.get('lora_rank', 8))
@@ -325,7 +301,6 @@ def main(args):
     bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
     if bfloat_enable:
         scaler = torch.amp.GradScaler()
-
 
     # 8 (如有)加载LoRA-only 续训 ckpt
     # 注意：这里加载的是 LoRA fine-tune 的 ckpt，不是 base ckpt
@@ -371,112 +346,66 @@ def main(args):
     model = DDP(model, device_ids=[device_id], find_unused_parameters=True)
     # ===================== LoRA修改结束：LoRA 微调流程 =====================
 
-
-    # ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    # requires_grad(ema, False)
-    #
-    # # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    # lr = float(config.get('lr', 1e-4))
-    # opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
-    #
-    # bfloat_enable = bool(hasattr(args, 'bfloat16') and args.bfloat16)
-    # if bfloat_enable:
-    #     scaler = torch.amp.GradScaler()
-    #
-    # # load existing checkpoint
-    # latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
-    # print('Searching for model from ', checkpoint_dir)
-    # start_epoch = 0
-    # train_steps = 0
-    # if os.path.isfile(latest_path) or config.get('from_checkpoint', 0):
-    #     if os.path.isfile(latest_path) and config.get('from_checkpoint', 0):
-    #         raise ValueError("Resuming from checkpoint, this might override latest.pth.tar!!")
-    #     latest_path = latest_path if os.path.isfile(latest_path) else config.get('from_checkpoint', 0)
-    #     print("Loading model from ", latest_path)
-    #     latest_checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
-    #
-    #     if "model" in latest_checkpoint:
-    #         model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['model'].items()}
-    #         res = model.load_state_dict(model_ckp, strict=True)
-    #         print("Loading model weights", res)
-    #
-    #         model_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['ema'].items()}
-    #         res = ema.load_state_dict(model_ckp, strict=True)
-    #         print("Loading EMA model weights", res)
-    #     else:
-    #         update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-    #
-    #     if "opt" in latest_checkpoint:
-    #         opt_ckp = {k.replace('_orig_mod.', ''):v for k,v in latest_checkpoint['opt'].items()}
-    #         opt.load_state_dict(opt_ckp)
-    #         print("Loading optimizer params")
-    #
-    #     if "epoch" in latest_checkpoint:
-    #         start_epoch = latest_checkpoint['epoch'] + 1
-    #
-    #     if "train_steps" in latest_checkpoint:
-    #         train_steps = latest_checkpoint["train_steps"]
-    #
-    #     if "scaler" in latest_checkpoint:
-    #         scaler.load_state_dict(latest_checkpoint["scaler"])
-    #
-    # # ~40% speedup but might leads to worse performance depending on pytorch version
-    # if args.torch_compile:
-    #     model = torch.compile(model)
-    #
-    # # 修改开始
-    # # model = DDP(model, device_ids=[device])
-    # model = DDP(model, device_ids=[device_id])
-    # # 修改结束
-
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     logger.info(f"CDiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     train_dataset = []
     test_dataset = []
 
+    # === 修改开始：geom cache root，从 config 读取，如果没有就是 None（fallback 到全零 geom） ===
+    geom_cache_root = config.get("geom_cache_root", None)
+    if rank == 0:
+        if geom_cache_root is None:
+            print("[geom] WARNING: 'geom_cache_root' not set in config. geom will be all-zero.")
+        else:
+            print(f"[geom] cache root: {geom_cache_root}")
+    # === 修改结束 ===
+
     for dataset_name in config["datasets"]:
         data_config = config["datasets"][dataset_name]
 
         for data_split_type in ["train", "test"]:
             if data_split_type in data_config:
-                    goals_per_obs = int(data_config["goals_per_obs"])
-                    if data_split_type == 'test':
-                        goals_per_obs = 4 # standardize testing
-                        # 其实不是很理解这个goals per observation是啥，看论文时注意
-                    
-                    if "distance" in data_config:
-                        min_dist_cat=data_config["distance"]["min_dist_cat"]
-                        max_dist_cat=data_config["distance"]["max_dist_cat"]
-                    else:
-                        min_dist_cat=config["distance"]["min_dist_cat"]
-                        max_dist_cat=config["distance"]["max_dist_cat"]
+                goals_per_obs = int(data_config["goals_per_obs"])
+                if data_split_type == 'test':
+                    goals_per_obs = 4  # standardize testing
+                    # 其实不是很理解这个goals per observation是啥，看论文时注意
 
-                    if "len_traj_pred" in data_config:
-                        len_traj_pred=data_config["len_traj_pred"]
-                    else:
-                        len_traj_pred=config["len_traj_pred"]
+                if "distance" in data_config:
+                    min_dist_cat = data_config["distance"]["min_dist_cat"]
+                    max_dist_cat = data_config["distance"]["max_dist_cat"]
+                else:
+                    min_dist_cat = config["distance"]["min_dist_cat"]
+                    max_dist_cat = config["distance"]["max_dist_cat"]
 
-                    dataset = TrainingDataset(
-                        data_folder=data_config["data_folder"],
-                        data_split_folder=data_config[data_split_type],
-                        dataset_name=dataset_name,
-                        image_size=config["image_size"],
-                        min_dist_cat=min_dist_cat,
-                        max_dist_cat=max_dist_cat,
-                        len_traj_pred=len_traj_pred,
-                        context_size=config["context_size"],
-                        normalize=config["normalize"],
-                        goals_per_obs=goals_per_obs,
-                        transform=transform,
-                        predefined_index=None,
-                        traj_stride=1,
-                    )
-                    if data_split_type == "train":
-                        train_dataset.append(dataset)
-                    else:
-                        test_dataset.append(dataset)
-                    print(f"Dataset: {dataset_name} ({data_split_type}), size: {len(dataset)}")
+                if "len_traj_pred" in data_config:
+                    len_traj_pred = data_config["len_traj_pred"]
+                else:
+                    len_traj_pred = config["len_traj_pred"]
+
+                dataset = TrainingDataset(
+                    data_folder=data_config["data_folder"],
+                    data_split_folder=data_config[data_split_type],
+                    dataset_name=dataset_name,
+                    image_size=config["image_size"],
+                    min_dist_cat=min_dist_cat,
+                    max_dist_cat=max_dist_cat,
+                    len_traj_pred=len_traj_pred,
+                    context_size=config["context_size"],
+                    normalize=config["normalize"],
+                    goals_per_obs=goals_per_obs,
+                    transform=transform,
+                    predefined_index=None,
+                    traj_stride=1,
+                    # === 修改开始 ===
+                    geom_cache_root=geom_cache_root,
+                    # === 修改结束 ===
+                )
+                if data_split_type == "train":
+                    train_dataset.append(dataset)
+                else:
+                    test_dataset.append(dataset)
+                print(f"Dataset: {dataset_name} ({data_split_type}), size: {len(dataset)}")
 
     # combine all the datasets from different robots
     print(f"Combining {len(train_dataset)} datasets.")
@@ -516,57 +445,31 @@ def main(args):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
 
-        for x, y, rel_t in loader:
+        # === 修改开始：dataloader 现在多返回一个 geom；删除所有在线 VGGT 代码 ===
+        for x, y, rel_t, geom in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             rel_t = rel_t.to(device, non_blocking=True)
+            geom = geom.to(device, non_blocking=True)  # [B, N_geom, 6]
             B, T = x.shape[:2]
 
-            # 修改开始（用原图的 context 帧提 geometry / tracks）
-            # x: [B, T, 3, H, W]
-            with torch.no_grad():
-                geom_list = []
-                # 修改提醒：想想优化（是否支持batch化geometry extraction；是否离线缓存tracks；是否只在dataset prepocessing阶段算一次）
-                for b in range(B):
+            # 原来 493-528 行的在线 VGGT 逻辑全部删除，
+            # geom 现在直接来自 dataloader（dataset 内部读 .npz 并组装好）。
+            # === 修改结束 ===
 
-                    images_bt = x[b, :num_cond]  # 只取 context, 不取全部T [:num_cond, 3, H, W]
-                    # vggt 输出 tracks
-                    pred_tracks, pred_vis_scores, pred_confs, _, _ = predict_tracks(images_bt)
-
-                    # 兼容 numpy / tensor
-                    if not torch.is_tensor(pred_tracks):
-                        pred_tracks = torch.from_numpy(pred_tracks)
-                    if not torch.is_tensor(pred_vis_scores):
-                        pred_vis_scores = torch.from_numpy(pred_vis_scores)
-                    if not torch.is_tensor(pred_confs):
-                        pred_confs = torch.from_numpy(pred_confs)
-
-                    pred_tracks = pred_tracks.to(device)            # 位置
-                    pred_vis_scores = pred_vis_scores.to(device)    # 每帧是否可见
-                    pred_confs = pred_confs.to(device)              # 整个track的质量（没有这一维容易被noisy points干扰）
-
-                    # 这里要做一个 geometry feature 组装
-                    geom_b = build_geom_from_tracks(pred_tracks, pred_vis_scores, pred_confs)
-                    # 目标：[N_geom, D] 这个D目前先定为4，后面看情况改成6（已加temporal）
-
-                    geom_list.append(geom_b)
-
-                geom = torch.stack(geom_list, dim=0)     # [B, N_geom, D]
-
-            # 修改结束
-            
             with torch.amp.autocast('cuda', enabled=bfloat_enable, dtype=torch.bfloat16):
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
                     B, T = x.shape[:2]
-                    x = x.flatten(0,1)
+                    x = x.flatten(0, 1)
                     x = tokenizer.encode(x).latent_dist.sample().mul_(0.18215)
                     x = x.unflatten(0, (B, T))
-                
+
                 num_goals = T - num_cond
                 x_start = x[:, num_cond:].flatten(0, 1)
                 # 所以这一大段都不是很懂，就是跟x相关的，再着重看一下
-                x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+                x_cond = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3],
+                                                             x.shape[4]).flatten(0, 1)
                 y = y.flatten(0, 1)
                 rel_t = rel_t.flatten(0, 1)
 
@@ -593,7 +496,7 @@ def main(args):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['grad_clip_val'])
                 scaler.step(opt)
                 scaler.update()
-            
+
             update_ema(ema, model.module)
 
             # Log loss values:
@@ -605,12 +508,13 @@ def main(args):
                 torch.cuda.synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                samples_per_sec = dist.get_world_size()*x_cond.shape[0]*steps_per_sec
+                samples_per_sec = dist.get_world_size() * x_cond.shape[0] * steps_per_sec
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
+                logger.info(
+                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, Samples/Sec: {samples_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -623,7 +527,7 @@ def main(args):
                     # 用一个外部 set 收集所有 requires_grad=True 的参数名
                     # 注意：DDP 包装后，参数前缀是 module., 所以从 model.module 取
                     raw_model = model.module if hasattr(model, "module") else model
-                    raw_model_for_keys = getattr(raw_model, "_orig_mod", raw_model) # 兼容 torch.compile
+                    raw_model_for_keys = getattr(raw_model, "_orig_mod", raw_model)  # 兼容 torch.compile
 
                     trainable_names = {
                         n for n, p in raw_model_for_keys.named_parameters() if p.requires_grad
@@ -651,28 +555,22 @@ def main(args):
                         "lora_alpha": lora_alpha,
                     }
 
-                    # checkpoint = {
-                    #     "model": model.module.state_dict(),
-                    #     "ema": ema.state_dict(),
-                    #     "opt": opt.state_dict(),
-                    #     "args": args,
-                    #     "epoch": epoch,
-                    #     "train_steps": train_steps
-                    # }
                     # ===================== LoRA修改结束：LoRA ckpt 只存可训练参数 =====================
                     if bfloat_enable:
                         checkpoint.update({"scaler": scaler.state_dict()})
                     checkpoint_path = f"{checkpoint_dir}/latest.pth.tar"
                     torch.save(checkpoint, checkpoint_path)
-                    if train_steps % (10*args.ckpt_every) == 0 and train_steps > 0:
+                    if train_steps % (10 * args.ckpt_every) == 0 and train_steps > 0:
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
                         torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-            
+
             if train_steps % args.eval_every == 0 and train_steps > 0:
                 eval_start_time = time()
                 save_dir = os.path.join(experiment_dir, str(train_steps))
-                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"], config["num_workers"], latent_size, device, save_dir, args.global_seed, bfloat_enable, num_cond)
+                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, rank, config["batch_size"],
+                                     config["num_workers"], latent_size, device, save_dir, args.global_seed,
+                                     bfloat_enable, num_cond)
                 dist.barrier()
                 eval_end_time = time()
                 eval_time = eval_end_time - eval_start_time
@@ -686,7 +584,8 @@ def main(args):
 
 
 @torch.no_grad
-def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir, seed, bfloat_enable, num_cond):
+def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_workers, latent_size, device, save_dir,
+             seed, bfloat_enable, num_cond):
     sampler = DistributedSampler(
         test_dataloaders,
         num_replicas=dist.get_world_size(),
@@ -709,16 +608,27 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
     n_samples = torch.tensor(0).to(device)
 
     # Run for 1 step
-    for x, y, rel_t in loader:
+    # === 修改开始：dataloader 现在多返回一个 geom ===
+    for x, y, rel_t, geom in loader:
         x = x.to(device)
         y = y.to(device)
         rel_t = rel_t.to(device).flatten(0, 1)
+        geom = geom.to(device)  # [B, N_geom, 6]
+        # === 修改结束 ===
         with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
             B, T = x.shape[:2]
             num_goals = T - num_cond
-            samples = model_forward_wrapper((model, diffusion, vae), x, y, num_timesteps=None, latent_size=latent_size, device=device, num_cond=num_cond, num_goals=num_goals, rel_t=rel_t)
+            # === 修改开始：把 geom 透传给 model_forward_wrapper ===
+            samples = model_forward_wrapper(
+                (model, diffusion, vae), x, y,
+                num_timesteps=None, latent_size=latent_size, device=device,
+                num_cond=num_cond, num_goals=num_goals, rel_t=rel_t,
+                geom=geom,
+            )
+            # === 修改结束 ===
             x_start_pixels = x[:, num_cond:].flatten(0, 1)
-            x_cond_pixels = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3], x.shape[4]).flatten(0, 1)
+            x_cond_pixels = x[:, :num_cond].unsqueeze(1).expand(B, num_goals, num_cond, x.shape[2], x.shape[3],
+                                                                x.shape[4]).flatten(0, 1)
             samples = samples * 0.5 + 0.5
             x_start_pixels = x_start_pixels * 0.5 + 0.5
             x_cond_pixels = x_cond_pixels * 0.5 + 0.5
@@ -726,21 +636,22 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
             score += res.sum()
             n_samples += len(res)
         break
-    
+
     if rank == 0:
         os.makedirs(save_dir, exist_ok=True)
         for i in range(min(samples.shape[0], 10)):
-            _, ax = plt.subplots(1,3,dpi=256)
-            ax[0].imshow((x_cond_pixels[i, -1].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-            ax[1].imshow((x_start_pixels[i].permute(1,2,0).cpu().numpy()*255).astype('uint8'))
-            ax[2].imshow((samples[i].permute(1,2,0).cpu().float().numpy()*255).astype('uint8'))
+            _, ax = plt.subplots(1, 3, dpi=256)
+            ax[0].imshow((x_cond_pixels[i, -1].permute(1, 2, 0).cpu().numpy() * 255).astype('uint8'))
+            ax[1].imshow((x_start_pixels[i].permute(1, 2, 0).cpu().numpy() * 255).astype('uint8'))
+            ax[2].imshow((samples[i].permute(1, 2, 0).cpu().float().numpy() * 255).astype('uint8'))
             plt.savefig(f'{save_dir}/{i}.png')
             plt.close()
 
     dist.all_reduce(score)
     dist.all_reduce(n_samples)
-    sim_score = score/n_samples
+    sim_score = score / n_samples
     return sim_score
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser()
@@ -754,6 +665,7 @@ def get_args_parser():
     parser.add_argument("--bfloat16", type=int, default=1)
     parser.add_argument("--torch-compile", type=int, default=1)
     return parser
+
 
 if __name__ == "__main__":
     args = get_args_parser().parse_args()

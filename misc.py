@@ -14,53 +14,58 @@ from PIL import Image
 from torchvision import transforms
 import torchvision.transforms.functional as TF
 
-
 IMAGE_ASPECT_RATIO = (4 / 3)  # all images are centered cropped to a 4:3 aspect ratio in training
 
 with open("config/data_config.yaml", "r") as f:
     data_config = yaml.safe_load(f)
 
 
-# 修改开始
-def build_geom_from_tracks(tracks, vis, confs, max_tokens=512):
-    """!!! 把vggt的尺寸给它调整回nvw的"""
+# =============================== 修改开始 ===============================
+def safe_traj_name(s: str) -> str:
+    """与 precompute_geom.py 中一致的 traj_name -> 文件名 安全化函数。"""
+    return s.replace("/", "_").replace("\\", "_")
+
+
+def build_geom_from_tracks(tracks, vis, confs, max_tokens=512,
+                           coord_h=518.0, coord_w=518.0):
     """
-    track:  [Tc, Nq, 2]
-    vis:    [Tc, Nq]
-    confs:  [Nq]
+    track:  [Tc, Nq, 2]   in VGGT square preprocessing space (~518x518)
+    vis:    [Tc, Nq]      in [0,1]
+    confs:  [Nq]          in [0,1]
+    coord_h / coord_w:    VGGT 坐标系的高 / 宽 (precompute 时的 vggt_resolution)
 
     return:
         geom: [N_geom, 6]
-                = [x_last, y_last, dx, dy, mean_vis, conf]
+              = [x_last, y_last, dx, dy, mean_vis, conf]
+        说明：
+            - x_last, y_last 归一化到 [0,1]
+            - dx, dy 在 [-1,1] 量级
+            - mean_vis, conf 本来就在 [0,1]
+        全部维度尺度兼容，对 MLP 友好。
     """
-    # 下面要计算，转到float
     tracks = tracks.float()
     vis = vis.float()
     confs = confs.float()
 
-    # nwm原始尺寸
-    img_w = 320.0
-    img_h = 240.0
+    # === 归一化到 [0,1] ===
+    # 不再用 tracks.max() 自适应估计（不稳：如果离群点 / 全部聚集都会出错），
+    # 而是用 precompute 时已知的 VGGT 内部分辨率做精确归一化。
+    coord_w = float(coord_w)
+    coord_h = float(coord_h)
+    tracks_norm = torch.empty_like(tracks)
+    tracks_norm[..., 0] = tracks[..., 0] / coord_w
+    tracks_norm[..., 1] = tracks[..., 1] / coord_h
 
-    # 从 tracks 自动估计 VGGT 内部坐标尺寸
-    ref_w = tracks[..., 0].max().item()
-    ref_h = tracks[..., 1].max().item()
+    # VGGT 偶尔会输出图像范围外的点，留点余地不强行截到 [0,1]
+    tracks_norm = tracks_norm.clamp(-0.5, 1.5)
+    # === 归一化结束 ===
 
-    ref_w = max(ref_w, 1e-6)
-    ref_h = max(ref_h, 1e-6)
-
-    # 把 tracks 映射回原图坐标系
-    tracks[..., 0] = tracks[..., 0] * (img_w / ref_w)
-    tracks[..., 1] = tracks[..., 1] * (img_h / ref_h)
-
-
-
-    # temporal-aware features
-    last_xy = tracks[-1]                        # [Nq, 2]
-    first_xy = tracks[0]                        # [Nq, 2]
-    delta_xy = last_xy - first_xy               # [Nq, 2]
-    mean_vis = vis.mean(dim=0).unsqueeze(-1)    # [Nq, 1]
-    confs_col = confs.unsqueeze(-1)             # [Nq, 1]
+    # temporal-aware features —— 全部在归一化空间里算
+    last_xy = tracks_norm[-1]  # [Nq, 2]
+    first_xy = tracks_norm[0]  # [Nq, 2]
+    delta_xy = last_xy - first_xy  # [Nq, 2]
+    mean_vis = vis.mean(dim=0).unsqueeze(-1)  # [Nq, 1]
+    confs_col = confs.unsqueeze(-1)  # [Nq, 1]
 
     geom = torch.cat([last_xy, delta_xy, mean_vis, confs_col], dim=-1)  # [Nq, 6]
 
@@ -71,7 +76,8 @@ def build_geom_from_tracks(tracks, vis, confs, max_tokens=512):
 
     return geom
 
-# 修改结束
+
+# =============================== 修改结束 ===============================
 
 
 def get_action_torch(diffusion_output, action_stats):
@@ -81,18 +87,21 @@ def get_action_torch(diffusion_output, action_stats):
     actions = torch.cumsum(ndeltas, dim=1)
     return actions.to(ndeltas)
 
-def log_viz_single(dataset_name, obs_image, goal_image, preds, deltas, loss, min_idx, actions, action_stats, plan_iter=0, output_dir='plot.png'):
+
+def log_viz_single(dataset_name, obs_image, goal_image, preds, deltas, loss, min_idx, actions, action_stats,
+                   plan_iter=0, output_dir='plot.png'):
     '''
     Visualize a single instance
     actions is gt actions
     '''
-    viz_obs_image = unnormalize(obs_image.detach().cpu())[-1] # take last img 
+    viz_obs_image = unnormalize(obs_image.detach().cpu())[-1]  # take last img
     viz_goal_image = unnormalize(goal_image.detach().cpu())
     deltas = deltas.detach().cpu()
     loss = loss.detach().cpu()
     actions = actions.detach().cpu()
     pred_actions = get_action_torch(deltas[:, :, :2], action_stats)
-    plot_array = plot_images_and_actions(dataset_name, viz_obs_image, viz_goal_image, pred_actions, actions, min_idx, loss=loss)
+    plot_array = plot_images_and_actions(dataset_name, viz_obs_image, viz_goal_image, pred_actions, actions, min_idx,
+                                         loss=loss)
 
     plt.imshow(plot_array)
     plt.axis('off')  # Hide axes for a cleaner image
@@ -100,14 +109,16 @@ def log_viz_single(dataset_name, obs_image, goal_image, preds, deltas, loss, min
     # Save the plot array as a PNG file locally
     plt.savefig(output_dir, format='png', dpi=300, bbox_inches='tight')
 
-def plot_images_and_actions(dataset_name, curr_viz_obs_image, curr_viz_goal_image, curr_viz_pred_actions, curr_viz_actions, min_idx, loss):
+
+def plot_images_and_actions(dataset_name, curr_viz_obs_image, curr_viz_goal_image, curr_viz_pred_actions,
+                            curr_viz_actions, min_idx, loss):
     curr_viz_obs_image = curr_viz_obs_image.permute(1, 2, 0).cpu().numpy()
     curr_viz_goal_image = curr_viz_goal_image.permute(1, 2, 0).cpu().numpy()
 
     # scale back to metric space for plotting
     curr_viz_pred_actions = curr_viz_pred_actions * data_config[dataset_name]['metric_waypoint_spacing']
     curr_viz_actions = curr_viz_actions * data_config[dataset_name]['metric_waypoint_spacing']
-    
+
     # Create the figure with three subplots
     fig, axs = plt.subplots(1, 3, figsize=(9, 3))
 
@@ -127,24 +138,24 @@ def plot_images_and_actions(dataset_name, curr_viz_obs_image, curr_viz_goal_imag
         label = f"Sample {i} Min Loss" if i == min_idx.item() else f"{i}"
 
         if i != min_idx.item():
-            axs[2].plot(-curr_viz_pred_actions[i, :, 1], curr_viz_pred_actions[i, :, 0], 
+            axs[2].plot(-curr_viz_pred_actions[i, :, 1], curr_viz_pred_actions[i, :, 0],
                         color=color, marker="o", markersize=5, label=label)
-            axs[2].text(-curr_viz_pred_actions[i, -1, 1], 
-                curr_viz_pred_actions[i, -1, 0], 
-                round(loss[i].item(), 3), 
-                color='black', 
-                fontsize=10, 
-                ha='left', va='bottom')  # Adjust position to avoid overlap
+            axs[2].text(-curr_viz_pred_actions[i, -1, 1],
+                        curr_viz_pred_actions[i, -1, 0],
+                        round(loss[i].item(), 3),
+                        color='black',
+                        fontsize=10,
+                        ha='left', va='bottom')  # Adjust position to avoid overlap
 
     # Highlight the minimum loss sample
-    axs[2].plot(-curr_viz_pred_actions[min_idx.item(), :, 1], curr_viz_pred_actions[min_idx.item(), :, 0], 
+    axs[2].plot(-curr_viz_pred_actions[min_idx.item(), :, 1], curr_viz_pred_actions[min_idx.item(), :, 0],
                 color='green', marker="o", markersize=5, label=f"{min_idx.item()}")
-    axs[2].text(-curr_viz_pred_actions[min_idx.item(), -1, 1], 
-        curr_viz_pred_actions[min_idx.item(), -1, 0], 
-        round(loss[min_idx.item()].item(), 3), 
-        color='black', 
-        fontsize=10, 
-        ha='left', va='bottom')  # Adjust position to avoid overlap
+    axs[2].text(-curr_viz_pred_actions[min_idx.item(), -1, 1],
+                curr_viz_pred_actions[min_idx.item(), -1, 0],
+                round(loss[min_idx.item()].item(), 3),
+                color='black',
+                fontsize=10,
+                ha='left', va='bottom')  # Adjust position to avoid overlap
 
     # Plot ground truth actions
     axs[2].plot(-curr_viz_actions[:, 1], curr_viz_actions[:, 0], color='blue', marker="o", label="GT")
@@ -182,10 +193,12 @@ def normalize_data(data, stats):
     ndata = ndata * 2 - 1
     return ndata
 
+
 def unnormalize_data(ndata, stats):
     ndata = (ndata + 1) / 2
     data = ndata * (stats['max'].to(ndata) - stats['min'].to(ndata)) + stats['min'].to(ndata)
     return data
+
 
 def get_data_path(data_folder: str, f: str, time: int, data_type: str = "image"):
     data_ext = {
@@ -193,6 +206,7 @@ def get_data_path(data_folder: str, f: str, time: int, data_type: str = "image")
         # add more data types here
     }
     return os.path.join(data_folder, f, f"{str(time)}{data_ext[data_type]}")
+
 
 def yaw_rotmat(yaw: float) -> np.ndarray:
     return np.array(
@@ -203,20 +217,23 @@ def yaw_rotmat(yaw: float) -> np.ndarray:
         ],
     )
 
+
 def angle_difference(theta1, theta2):
-    delta_theta = theta2 - theta1    
-    delta_theta = delta_theta - 2 * np.pi * np.floor((delta_theta + np.pi) / (2 * np.pi))    
+    delta_theta = theta2 - theta1
+    delta_theta = delta_theta - 2 * np.pi * np.floor((delta_theta + np.pi) / (2 * np.pi))
     return delta_theta
+
 
 def get_delta_np(actions):
     # append zeros to first action (unbatched)
     ex_actions = np.concatenate((np.zeros((1, actions.shape[1])), actions), axis=0)
     delta = ex_actions[1:] - ex_actions[:-1]
-    
+
     return delta
 
+
 def to_local_coords(
-    positions: np.ndarray, curr_pos: np.ndarray, curr_yaw: float
+        positions: np.ndarray, curr_pos: np.ndarray, curr_yaw: float
 ) -> np.ndarray:
     """
     Convert positions to local coordinates
@@ -238,22 +255,25 @@ def to_local_coords(
 
     return (positions - curr_pos).dot(rotmat)
 
+
 def calculate_delta_yaw(unnorm_actions):
     x = unnorm_actions[..., 0]
     y = unnorm_actions[..., 1]
-    
+
     yaw = torch.atan2(y, x).unsqueeze(-1)
     delta_yaw = torch.cat((torch.zeros(yaw.shape[0], 1, yaw.shape[2]).to(yaw.device), yaw), dim=1)
     delta_yaw = delta_yaw[:, 1:, :] - delta_yaw[:, :-1, :]
-    
+
     return delta_yaw
 
-def save_planning_pred(dataset_save_output_dir, B, idxs, obs_image, goal_image, preds, deltas, loss, gt_actions, plan_iter=0):
+
+def save_planning_pred(dataset_save_output_dir, B, idxs, obs_image, goal_image, preds, deltas, loss, gt_actions,
+                       plan_iter=0):
     for batch_idx, idx in enumerate(idxs.flatten()):
         sample_idx = int(idx)
         sample_folder = os.path.join(dataset_save_output_dir, f'id_{sample_idx}')
         os.makedirs(sample_folder, exist_ok=True)
-        
+
         preds_save = {
             'obs_image': obs_image[batch_idx],
             'goal_image': goal_image[batch_idx],
@@ -264,7 +284,8 @@ def save_planning_pred(dataset_save_output_dir, B, idxs, obs_image, goal_image, 
         }
         preds_file = os.path.join(sample_folder, f"preds_{plan_iter}.pth")
         torch.save(preds_save, preds_file)
-        
+
+
 class CenterCropAR:
     def __init__(self, ar: float = IMAGE_ASPECT_RATIO):
         self.ar = ar
@@ -276,6 +297,7 @@ class CenterCropAR:
         else:
             img = TF.center_crop(img, (int(w / self.ar), w))
         return img
+
 
 transform = transforms.Compose([
     CenterCropAR(),
@@ -294,13 +316,15 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class LoRALinear(nn.Module):
     """
     与 train.py 里的 LoRALinear 完全一致
     单独写一份是为了让推理脚本不依赖 train.py 的 import 链（train.py 顶部
     会 import vggt 等重量级依赖，推理时不一定都需要）
     """
-    def __init__(self,base_layer: nn.Linear, rank=8, alpha=16, dropout=0.0):
+
+    def __init__(self, base_layer: nn.Linear, rank=8, alpha=16, dropout=0.0):
         super().__init__()
         if not isinstance(base_layer, nn.Linear):
             raise TypeError(f"LoRALinear only supports nn.Linear, got {type(base_layer)}")
@@ -331,6 +355,7 @@ class LoRALinear(nn.Module):
         lora_out = F.linear(F.linear(x_d, self.lora_A), self.lora_B)
         return base_out + self.scaling * lora_out
 
+
 def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0):
     """ 递归把所有 nn.Linear 替换成 LoRALinear（与 train.py 同名函数一致）"""
     for name, child in list(module.named_children()):
@@ -338,6 +363,7 @@ def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0):
             setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
         else:
             replace_linear_with_lora(child, rank=rank, alpha=alpha, dropout=dropout)
+
 
 def load_model_for_inference(model, base_ckpt_path, lora_ckpt_path,
                              lora_rank=8, lora_alpha=16, lora_dropout=0.0,

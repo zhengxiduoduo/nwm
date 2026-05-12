@@ -5,6 +5,8 @@ lora_rank: 8
 lora_alpha: 16
 lora_dropout: 0.0
 
+geom_cache_root: "/media/jingzhang/T7 Shield/datasets/scand_geom_cache"
+
 # training setup
 results_dir: logs
 train: True
