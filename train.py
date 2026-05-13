@@ -114,8 +114,22 @@ def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0, v
     """
     递归 替换所有 Linear 为 LoRA
     Recursively replace all nn.Linear in module with LoRALinear.
+
+    注意: 跳过 nn.MultiheadAttention 子树。
+    nn.MultiheadAttention 的 forward 会走 F.multi_head_attention_forward 这条
+    fused 路径，直接读 self.out_proj.weight / bias（当 tensor 用，不调 __call__），
+    一旦 out_proj 被换成 LoRALinear 这个包装类，顶层就没有 .weight 属性，
+    会抛 AttributeError: 'LoRALinear' object has no attribute 'weight'。
+    因此对 MHA 整个子树原样保留，不做 LoRA 注入。
+    其他普通 Linear（timm Attention 的 qkv/proj、MLP、adaLN_modulation 等）
+    走标准 __call__ → forward(x) 路径，仍然会被正常包成 LoRALinear。
     """
     for name, child in list(module.named_children()):
+        if isinstance(child, nn.MultiheadAttention):
+            # 跳过整个 MHA 子树，不递归进去
+            if verbose:
+                print(f"[LoRA] Skipped MultiheadAttention subtree: {name}")
+            continue
         if isinstance(child, nn.Linear):
             setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha, dropout=dropout))
             if verbose:
@@ -245,13 +259,31 @@ def main(args):
 
     if base_ckpt_path:
         print("Load BASE pretrained checkpoint from", base_ckpt_path)
-        base_ckpt = torch.load(base_ckpt_path, map_locaation='cpu', weights_only=False)
+        base_ckpt = torch.load(base_ckpt_path, map_location='cpu', weights_only=False)
         # 优先用 ema 权重做 base，效果通常更好；没有就用 model
         base_state = base_ckpt.get('ema', base_ckpt.get('model'))
         base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
-        res = model.load_state_dict(base_state, strict=False)
-        print(f"[Base ckpt] missing keys: {len(res.missing_keys)}, unexpected: {len(res.unexpected_keys)}")
+
+        # 过滤掉形状不匹配的参数（新增 geometry/gcttn 后 adaLN_modulation
+        # 从 11*hidden 扩到 16*hidden，这些层需要重新随机初始化）
+        model_state = model.state_dict()
+        skipped = []
+        filtered_state = {}
+        for k, v in base_state.items():
+            if k in model_state and v.shape == model_state[k].shape:
+                filtered_state[k] = v
+            elif k in model_state:
+                skipped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+
+        res = model.load_state_dict(filtered_state, strict=False)
+        print(f"[Base ckpt] loaded: {len(filtered_state)}, "
+              f"missing: {len(res.missing_keys)}, "
+              f"unexpected: {len(res.unexpected_keys)}, "
+              f"shape-skipped: {len(skipped)}")
         if rank == 0:  # real logger
+            print("     shape-skipped (随机初始化, 例如新扩的 adaLN_modulation):")
+            for k, ck_shape, md_shape in skipped[:20]:
+                print(f"          {k}: ckpt{ck_shape} -> model{md_shape}")
             print("     missing (新加板块，应当包含 geometry/gcttn/norm_geom/adaLN_modulation):")
             for k in res.missing_keys[:20]:
                 print("         ", k)

@@ -254,7 +254,7 @@ def main(args):
             verbose=True,
         )
 
-        # === 修改：原来这里是 torch.copile (typo)。改回 torch.compile ===
+        # === 修改：原来这里是 torch.compile (typo)。改回 torch.compile ===
         model = torch.compile(model)
         diffusion = create_diffusion(str(250))
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
