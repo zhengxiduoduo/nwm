@@ -365,15 +365,51 @@ def replace_linear_with_lora(module: nn.Module, rank=8, alpha=16, dropout=0.0):
             replace_linear_with_lora(child, rank=rank, alpha=alpha, dropout=dropout)
 
 
+def _filter_shape_mismatch(state_dict, model, verbose=True, tag="base"):
+    """
+    === 修改新增 ===
+    过滤掉 state_dict 里和 model 当前结构 shape 不匹配的 key。
+
+    背景：我们在 CDiT block 里把 adaLN_modulation 从 11 路扩到了 16 路（加了
+    geometry cross-attention 的 5 路 modulation）。原版 NWM base ckpt 里的
+    adaLN_modulation.1.weight 是 [4224, 384]，新模型是 [6144, 384]，
+    直接 load_state_dict 即使 strict=False 也会因为 shape mismatch 报错。
+
+    这里把这些不匹配的 key 主动剔除，让它们走 missing 路径。被剔除的层会
+    保持模型自身的初始化（adaLN 在 models.py 里是零初始化），训练时
+    本来就预期重新学，所以丢掉 base 的对应权重是可接受的。
+
+    Returns: (filtered_state_dict, skipped_list)
+        skipped_list: [(key, ckpt_shape, model_shape), ...]
+    """
+    model_state = model.state_dict()
+    filtered = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in model_state and hasattr(v, 'shape') and model_state[k].shape != v.shape:
+            skipped.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            continue
+        filtered[k] = v
+    if verbose and skipped:
+        print(f"[Inference] Skipping {len(skipped)} shape-mismatched keys from {tag} ckpt:")
+        for k, ck_shape, mdl_shape in skipped[:8]:
+            print(f"    {k}: ckpt {ck_shape} vs model {mdl_shape}")
+        if len(skipped) > 8:
+            print(f"    ... and {len(skipped) - 8} more")
+    return filtered, skipped
+
+
 def load_model_for_inference(model, base_ckpt_path, lora_ckpt_path,
                              lora_rank=8, lora_alpha=16, lora_dropout=0.0,
                              device='cuda', verbose=True):
     """
     推理时加载 LoRA 微调后的模型
     顺序与训练对齐：
-        1）加载 base 预训练 ckpt（strict=False，容忍新加的 geometry 模块）
+        1）加载 base 预训练 ckpt（strict=False，且过滤掉 shape mismatch 的 key，
+            容忍新加的 geometry 模块 + 扩维后的 adaLN_modulation）
         2）注入 LoRA
-        3）加载 LoRA fine-tune ckpt（strict=False，因为只存了可训练参数）
+        3）加载 LoRA fine-tune ckpt（strict=False，因为只存了可训练参数；
+            adaLN_modulation 16 路权重在这一步从 LoRA ckpt 装回来）
         4）.to(device).eval()
 
     Args:
@@ -394,6 +430,11 @@ def load_model_for_inference(model, base_ckpt_path, lora_ckpt_path,
         base_ckpt = torch.load(base_ckpt_path, map_location='cpu', weights_only=False)
         base_state = base_ckpt.get('ema', base_ckpt.get('model'))
         base_state = {k.replace('_orig_mod.', ''): v for k, v in base_state.items()}
+
+        # === 修改新增：过滤 shape mismatch，避免 11 路 vs 16 路 adaLN 直接报错 ===
+        base_state, _ = _filter_shape_mismatch(base_state, model, verbose=verbose, tag="base")
+        # === 修改新增结束 ===
+
         res = model.load_state_dict(base_state, strict=False)
         if verbose:
             print(f"[Inference] base: missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
@@ -411,6 +452,16 @@ def load_model_for_inference(model, base_ckpt_path, lora_ckpt_path,
         # 推理优先用 ema 权重（更稳定）；没有就用 model
         lora_state = lora_ckpt.get('ema', lora_ckpt.get('model'))
         lora_state = {k.replace('_orig_mod.', ''): v for k, v in lora_state.items()}
+
+        # === 修改新增：理论上 LoRA ckpt 不该有 shape mismatch（因为它就是用当前
+        #     模型结构存出来的），但保险起见过滤一下；如果触发了说明 lora_rank
+        #     等超参跟训练对不上，需要 print 出来排查。 ===
+        lora_state, lora_skipped = _filter_shape_mismatch(lora_state, model, verbose=verbose, tag="lora")
+        if lora_skipped and verbose:
+            print("[Inference] WARNING: LoRA ckpt 有 shape mismatch！"
+                  "请检查 lora_rank / lora_alpha 是否与训练时一致。")
+        # === 修改新增结束 ===
+
         res = model.load_state_dict(lora_state, strict=False)
         if verbose:
             print(f"[Inference] lora: missing={len(res.missing_keys)}, unexpected={len(res.unexpected_keys)}")
